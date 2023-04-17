@@ -31,7 +31,7 @@
  * */
 
 /* Global variables */
-static int NUM_FREE_LISTS = 10; // Change this value according to your desired free list size classes
+static int NUM_FREE_LISTS = 16; // Change this value according to your desired free list size classes
 static char **segregated_free_lists; // TODO You may use global variables.
 // Global variables
 // Array of pointers to segregated free lists
@@ -41,7 +41,6 @@ static char **segregated_free_lists; // TODO You may use global variables.
  * You may change or redefine these to your liking
  * */
 static void insert_into_free_list(char *bp); // Change this value according to your desired free list size classes
-static char **segregated_free_lists; // Declare a pointer to pointer
 static void remove_from_free_list(char *bp);
 static char *find_fit(size_t asize);
 static void *coalesce(char *bp);
@@ -50,7 +49,11 @@ static void *coalesce(char *bp);
 #define GET(p)          (*(uint64_t *)(p))
 #define PUT(p, val)     (*(uint64_t *)(p) = (val), \
                          *(uint64_t *)((char *)(p) + GET_SIZE(p) - HEADER_SIZE) = (val))
-#define PUT_NEXT(p, val) (*(uint64_t *)((char *)(p) + HEADER_SIZE) = (val))
+#define PUT_PREV(p, val) (*(uint64_t *)((char *)(p) + HEADER_SIZE) = (val))
+#define GET_PREV(p) (*(uint64_t *)((char *)(p) + HEADER_SIZE))
+#define PUT_NEXT(p, val) (*(uint64_t *)((char *)(p) + HEADER_SIZE + sizeof(uint64_t)) = (val))
+#define GET_NEXT(p) (*(uint64_t *)((char *)(p) + HEADER_SIZE + sizeof(uint64_t)))
+
 
 #define GET_SIZE(p)     (GET(p) & ~(ALIGNMENT-1))
 #define GET_ALLOC(p)    (GET(p) & 0x1)
@@ -75,6 +78,28 @@ static int find_list_index(size_t size) {
     return index;
 }
 
+static void insert_into_bst(char **root, char *bp) {
+    if (*root == NULL) {
+        *root = bp;
+        PUT_PREV(bp, 0);
+        PUT_NEXT(bp, 0);
+        return;
+    }
+
+    size_t bp_size = GET_SIZE(bp);
+    size_t root_size = GET_SIZE(*root);
+
+    if (bp_size < root_size) {
+        insert_into_bst((char **)(&(GET_PREV(*root))), bp);
+    } else {
+        insert_into_bst((char **)(&(GET_NEXT(*root))), bp);
+    }
+}
+
+
+
+
+
 
 int mm_init(void)
 {
@@ -85,8 +110,8 @@ int mm_init(void)
     *   So that p is now 8-byte offset from 16-byte alignment.
     *   This allows space for the 8-byte header.
     */
-    segregated_free_lists = (char **)mem_sbrk(NUM_FREE_LISTS * sizeof(char *));
-    if (segregated_free_lists == (void *)-1) {
+    segregated_free_lists = (char **) malloc(NUM_FREE_LISTS * sizeof(char *));
+    if (segregated_free_lists == NULL) {
         return -1;
     }
     int i;
@@ -149,14 +174,16 @@ void *mm_malloc(size_t size)
  * You are encouraged to implement a lazy coalesce, that coalesces during malloc, not free.
  * If you wish to receive extra credit, mm_free and any of its subroutines must not coalesce.
  */
+
+
 void mm_free(void *ptr)
 {
     char *bp = (char *)ptr - HEADER_SIZE;
     size_t size = GET_SIZE(bp);
 
     PUT(bp, HEADER(size, 0)); // Mark the block as unallocated
-    bp = coalesce(bp); // Coalesce the block if necessary
-    insert_into_free_list(bp); // Insert the block into the segregated free list
+    int list_index = find_list_index(GET_SIZE(bp));
+    insert_into_bst(&(segregated_free_lists[list_index]), bp);
 }
 
 
@@ -170,11 +197,25 @@ void mm_free(void *ptr)
  */
 static void insert_into_free_list(char *bp) {
     int list_index = find_list_index(GET_SIZE(bp));
-
-    char *next = segregated_free_lists[list_index];
-    PUT_NEXT(bp, (uint64_t)next); // Set the next pointer in the current block
-    segregated_free_lists[list_index] = bp; // Update the free list head
+    insert_into_bst(segregated_free_lists[list_index], bp);
 }
+
+static char *find_fit_in_bst(char *root, size_t asize) {
+    if (root == NULL) {
+        return NULL;
+    }
+
+    size_t root_size = GET_SIZE(root);
+    if (root_size >= asize) {
+        char *left_child = (char *)GET_PREV(root);
+        char *fit = find_fit_in_bst(left_child, asize);
+        return fit ? fit : root;
+    } else {
+        char *right_child = (char *)GET_NEXT(root);
+        return find_fit_in_bst(right_child, asize);
+    }
+}
+
 
 static void remove_from_free_list(char *bp) {
     int list_index = find_list_index(GET_SIZE(bp));
@@ -197,21 +238,13 @@ static char *find_fit(size_t asize) {
     int list_index = find_list_index(asize);
     int j;
     for (j = list_index; j < NUM_FREE_LISTS; j++) {
-        char *bp = segregated_free_lists[j];
-        while (bp != NULL && bp >= (char *)mem_heap_lo() && bp < (char *)mem_heap_hi()) {
-            size_t block_size = GET_SIZE(bp);
-            if (block_size >= asize) {
-                return bp;
-            }
-            bp = (char *)GET(bp);
+        char *bp = find_fit_in_bst(segregated_free_lists[j], asize);
+        if (bp) {
+            return bp;
         }
     }
-
     return NULL;
 }
-
-
-
 
 static void *coalesce(char *bp) {
     char *prev_blk = PREV_BLK(bp);
@@ -223,33 +256,28 @@ static void *coalesce(char *bp) {
         return bp;
     }
 
-    if (!prev_alloc || !next_alloc) {
-        remove_from_free_list(bp);
-    }
-
     if (!prev_alloc && !next_alloc) {
         remove_from_free_list(prev_blk);
         remove_from_free_list(next_blk);
+    } else if (!prev_alloc) {
+        remove_from_free_list(prev_blk);
+    } else if (!next_alloc) {
+        remove_from_free_list(next_blk);
     }
 
-    // The original coalescing cases are now handled here
-    if (prev_alloc && next_alloc) { // Case 1: Both previous and next blocks are allocated
-        insert_into_free_list(bp);
-    } else if (prev_alloc && !next_alloc) { // Case 2: Only next block is free
-        size_t new_size = GET_SIZE(bp) + GET_SIZE(next_blk);
-        PUT(bp, HEADER(new_size, 0));
-        insert_into_free_list(bp);
-    } else if (!prev_alloc && next_alloc) { // Case 3: Only previous block is free
+    if (!prev_alloc) {
         size_t new_size = GET_SIZE(bp) + GET_SIZE(prev_blk);
         PUT(prev_blk, HEADER(new_size, 0));
         bp = prev_blk;
-        insert_into_free_list(bp);
-    } else { // Case 4: Both previous and next blocks are free
-        size_t new_size = GET_SIZE(bp) + GET_SIZE(prev_blk) + GET_SIZE(next_blk);
-        PUT(prev_blk, HEADER(new_size, 0));
-        bp = prev_blk;
-        insert_into_free_list(bp);
     }
+
+    if (!next_alloc) {
+        size_t new_size = GET_SIZE(bp) + GET_SIZE(next_blk);
+        PUT(bp, HEADER(new_size, 0));
+    }
+
+    int list_index = find_list_index(GET_SIZE(bp));
+    insert_into_bst(&(segregated_free_lists[list_index]), bp);
 
     return bp;
 }
